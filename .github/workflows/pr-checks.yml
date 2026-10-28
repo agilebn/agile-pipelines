@@ -1,0 +1,347 @@
+# ndpx central pull request checks.
+# Called from every app repository. Do not copy this file into app repositories.
+# Runs the common checks (code-checks.yml) plus web-only stages: build and bundle scan, coverage, licences,
+# database migrations and RLS tests, Netlify preview, security headers and OWASP ZAP.
+# The single required status check for branch rules is the top-level job "result".
+name: ndpx PR checks
+
+on:
+  workflow_call:
+    inputs:
+      pipelines-ref:
+        description: Ref of ndpx-pipelines to load scripts and config from. Keep equal to the ref in `uses:`.
+        type: string
+        default: v1
+      # Repository variables of the calling app are passed in explicitly:
+      # a reusable workflow in another repository cannot read the caller's `vars`.
+      dev-supabase-url:
+        type: string
+        default: ""
+      dev-supabase-publishable-key:
+        type: string
+        default: ""
+      code-reviewers:
+        type: string
+        default: ""
+      require-ai-review:
+        type: string
+        default: "false"
+      require-preview:
+        type: string
+        default: "false"
+      ai-review-model:
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      NETLIFY_AUTH_TOKEN:
+        required: false
+      NETLIFY_DEV_SITE_ID:
+        required: false
+
+permissions: {}
+
+env:
+  PIPELINES_REPO: agilebn/agile-pipelines
+  SUPABASE_CLI_VERSION: "2.122.0"
+  NETLIFY_CLI_VERSION: "27.14.2"
+  PSYCOPG_VERSION: "3.3.6"
+  PYYAML_VERSION: "6.0.3"
+
+jobs:
+  config:
+    name: Read pipeline config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      risk_tier: ${{ steps.cfg.outputs.risk_tier }}
+      coverage_lines: ${{ steps.cfg.outputs.coverage_lines }}
+      node_version: ${{ steps.cfg.outputs.node_version }}
+      build_dir: ${{ steps.cfg.outputs.build_dir }}
+      src_dir: ${{ steps.cfg.outputs.src_dir }}
+      env_prefix: ${{ steps.cfg.outputs.env_prefix }}
+      has_supabase: ${{ steps.cfg.outputs.has_supabase }}
+      has_format_check: ${{ steps.cfg.outputs.has_format_check }}
+      has_typecheck: ${{ steps.cfg.outputs.has_typecheck }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PIPELINES_REPO }}
+          ref: ${{ inputs.pipelines-ref }}
+          path: .ndpx-pipelines
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install "pyyaml==${PYYAML_VERSION}"
+      - id: cfg
+        name: Check platform contract and read config
+        run: python .ndpx-pipelines/scripts/read_config.py .ndpx/pipeline.yml
+
+  code:
+    name: Code quality, tests, bundle and dependencies
+    needs: config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PIPELINES_REPO }}
+          ref: ${{ inputs.pipelines-ref }}
+          path: .ndpx-pipelines
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ needs.config.outputs.node_version }}
+          cache: npm
+      - name: Install (lockfile only)
+        run: npm ci --ignore-scripts
+      - name: "C01 Formatting"
+        if: needs.config.outputs.has_format_check == 'true'
+        run: npm run format:check
+      - name: "C02 Linting"
+        run: npm run lint
+      - name: "C03 Type checking"
+        if: needs.config.outputs.has_typecheck == 'true'
+        run: npm run typecheck
+      - name: "C04 Unit tests"
+        run: npm run test:coverage
+      - name: "C05 Coverage minimum for risk tier"
+        env:
+          COVERAGE_LINES: ${{ needs.config.outputs.coverage_lines }}
+        run: python3 .ndpx-pipelines/scripts/check_coverage.py --summary coverage/coverage-summary.json --min "${COVERAGE_LINES}"
+      - name: Set placeholder build variables
+        env:
+          PREFIX: ${{ needs.config.outputs.env_prefix }}
+        run: |
+          echo "${PREFIX}SUPABASE_URL=https://ci-placeholder.supabase.co" >> "$GITHUB_ENV"
+          echo "${PREFIX}SUPABASE_PUBLISHABLE_KEY=sb_publishable_ci_placeholder" >> "$GITHUB_ENV"
+      - name: Build
+        run: npm run build
+      - name: "Bundle scan: no secrets in browser code"
+        env:
+          BUILD_DIR: ${{ needs.config.outputs.build_dir }}
+          SRC_DIR: ${{ needs.config.outputs.src_dir }}
+        run: python3 .ndpx-pipelines/scripts/scan_bundle.py --dist "$BUILD_DIR" --src "$SRC_DIR"
+      - name: "C09 Dependency vulnerabilities (high and critical)"
+        run: npm audit --audit-level=high
+      - name: "C10 Licence compliance"
+        run: >-
+          python3 .ndpx-pipelines/scripts/check_licenses.py
+          --lockfile package-lock.json
+          --allow .ndpx-pipelines/config/licenses.txt
+          --exceptions .ndpx/license-exceptions.txt
+
+  common:
+    # Baseline checks shared with every ndpx repository: secrets, Semgrep, Python/SQL/Docker content, AI review.
+    # The ref here must match pipelines-ref. Both move together when a new major version (v2) is released.
+    name: Common checks
+    uses: agilebn/agile-pipelines/.github/workflows/code-checks.yml@v1 # zizmor: ignore[unpinned-uses] own repository, moves with v1
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+    with:
+      pipelines-ref: ${{ inputs.pipelines-ref }}
+      code-reviewers: ${{ inputs.code-reviewers }}
+      require-ai-review: ${{ inputs.require-ai-review }}
+      ai-review-model: ${{ inputs.ai-review-model }}
+      profile: web
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  database:
+    name: "Database: migrations, RLS tests, security checks"
+    needs: config
+    # Skipped only for apps with no Supabase dependency (read_config fails apps that use Supabase without migrations).
+    if: needs.config.outputs.has_supabase == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PIPELINES_REPO }}
+          ref: ${{ inputs.pipelines-ref }}
+          path: .ndpx-pipelines
+          persist-credentials: false
+      - name: Applied migrations must not be edited
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed="$(git diff --name-only --diff-filter=MDR "${BASE_SHA}...${HEAD_SHA}" -- supabase/migrations || true)"
+          if [ -n "$changed" ]; then
+            echo "::error::Existing migration files were modified or deleted. Add a new migration instead:"
+            echo "$changed"
+            exit 1
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Install Supabase CLI (npm, checksum-verified binary)
+        run: |
+          npm install --no-fund --no-audit --prefix "$RUNNER_TEMP/supabase-cli" "supabase@${SUPABASE_CLI_VERSION}"
+          echo "$RUNNER_TEMP/supabase-cli/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Start local Supabase and apply all migrations
+        env:
+          SUPABASE_AUTH_EXTERNAL_AZURE_CLIENT_ID: ci-placeholder
+          SUPABASE_AUTH_EXTERNAL_AZURE_SECRET: ci-placeholder
+          SUPABASE_AUTH_EXTERNAL_AZURE_URL: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
+        run: supabase start
+      - name: Database lint
+        run: supabase db lint --level warning --fail-on error
+      - name: RLS tests (pgTAP)
+        run: supabase test db
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install "psycopg[binary]==${PSYCOPG_VERSION}" "pyyaml==${PYYAML_VERSION}"
+      - name: Database security checks
+        run: >-
+          python .ndpx-pipelines/scripts/check_db_security.py
+          --dsn postgresql://postgres:postgres@127.0.0.1:54322/postgres
+          --config .ndpx/pipeline.yml
+
+  preview:
+    name: "Preview deploy, headers and DAST"
+    needs: [config, code, database]
+    if: >-
+      always() && github.event.pull_request.head.repo.full_name == github.repository
+      && needs.config.result == 'success' && needs.code.result == 'success'
+      && (needs.database.result == 'success' || needs.database.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_DEV_SITE_ID }}
+      REQUIRE_PREVIEW: ${{ inputs.require-preview }}
+    steps:
+      - name: Skip when Netlify is not configured
+        id: gate
+        run: |
+          if [ -z "${NETLIFY_AUTH_TOKEN}" ] || [ -z "${NETLIFY_SITE_ID}" ]; then
+            if [ "${REQUIRE_PREVIEW}" = "true" ]; then
+              echo "::error::Preview is required but Netlify secrets are not set."; exit 1
+            fi
+            echo "::warning::Preview skipped: NETLIFY_AUTH_TOKEN or NETLIFY_DEV_SITE_ID not set."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PIPELINES_REPO }}
+          ref: ${{ inputs.pipelines-ref }}
+          path: .ndpx-pipelines
+          persist-credentials: false
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ needs.config.outputs.node_version }}
+          cache: npm
+      - if: steps.gate.outputs.run == 'true'
+        name: Build against the development Supabase project
+        env:
+          PREFIX: ${{ needs.config.outputs.env_prefix }}
+          DEV_URL: ${{ inputs.dev-supabase-url }}
+          DEV_KEY: ${{ inputs.dev-supabase-publishable-key }}
+          BUILD_DIR: ${{ needs.config.outputs.build_dir }}
+          SRC_DIR: ${{ needs.config.outputs.src_dir }}
+        run: |
+          if [ -z "${DEV_URL}" ] || [ -z "${DEV_KEY}" ]; then
+            echo "::error::dev-supabase-url or dev-supabase-publishable-key is empty. Set DEV_SUPABASE_URL and DEV_SUPABASE_PUBLISHABLE_KEY as repository variables and pass them in ci.yml."
+            exit 1
+          fi
+          export "${PREFIX}SUPABASE_URL=${DEV_URL}" "${PREFIX}SUPABASE_PUBLISHABLE_KEY=${DEV_KEY}"
+          npm ci --ignore-scripts
+          npm run build
+          python3 .ndpx-pipelines/scripts/scan_bundle.py --dist "$BUILD_DIR" --src "$SRC_DIR"
+          if ! grep -rqF "${DEV_URL}" "$BUILD_DIR"; then
+            echo "::error::The built app does not contain the Supabase URL. Check env_prefix in .ndpx/pipeline.yml matches the framework."
+            exit 1
+          fi
+      - if: steps.gate.outputs.run == 'true'
+        id: deploy
+        name: Deploy preview to Netlify
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BUILD_DIR: ${{ needs.config.outputs.build_dir }}
+        run: |
+          set -euo pipefail
+          EXPECTED_JS="$(grep -oE '[A-Za-z0-9_./-]+\.js' "$BUILD_DIR/index.html" | head -1 || true)"
+          EXPECTED_JS="${EXPECTED_JS:-index.html}"
+          npx --yes "netlify-cli@${NETLIFY_CLI_VERSION}" deploy --no-build --dir "$BUILD_DIR" --site "$NETLIFY_SITE_ID" \
+            --auth "$NETLIFY_AUTH_TOKEN" --alias "pr-${PR_NUMBER}" --message "PR ${PR_NUMBER}" --json > deploy.json
+          # Use the deploy's own permanent address. The pr-N alias can keep serving an older deploy.
+          url="$(python3 -c 'import json; d = json.load(open("deploy.json")); i, n = d.get("deploy_id"), d.get("site_name"); print(f"https://{i}--{n}.netlify.app" if i and n else d["deploy_url"])')"
+          echo "Preview: ${url}"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+          if ! curl -sSf "$url/" | grep -qF "${EXPECTED_JS}"; then
+            echo "::error::The preview does not serve the build just made (${EXPECTED_JS})."; exit 1
+          fi
+      - if: steps.gate.outputs.run == 'true'
+        name: Security headers
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: python3 .ndpx-pipelines/scripts/check_headers.py --url "$URL" --smoke
+      - if: steps.gate.outputs.run == 'true'
+        name: "C22 OWASP ZAP baseline scan"
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          mkdir -p zap && cp .ndpx-pipelines/config/zap-rules.tsv zap/ && chmod -R 777 zap
+          docker run --rm -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$URL" -c zap-rules.tsv -I -r zap-report.html
+      - if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-report
+          path: zap/zap-report.html
+          if-no-files-found: ignore
+      - if: steps.gate.outputs.run == 'true'
+        name: Comment preview link
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          printf '### Preview\n\n%s\n\nThis link is for this commit only. Built against the **development** Supabase project. Fake data only.\n' "$URL" > preview.md
+          python3 .ndpx-pipelines/scripts/pr_comment.py --marker ndpx-preview --body-file preview.md
+
+  result:
+    name: result
+    needs: [config, code, common, database, preview]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: All checks must pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e '[to_entries[] | select(.value.result != "success" and .value.result != "skipped")] | length == 0' > /dev/null \
+            || { echo "::error::One or more ndpx checks failed."; exit 1; }
+

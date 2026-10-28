@@ -1,0 +1,230 @@
+# Agile central deployment: staging and production.
+# Production runs only from main, started by hand. A Jira Change Request is optional:
+# when a key is given, it must be approved for the exact commit being deployed.
+#
+# Requires GitHub environments "staging" and "production" in the app repository
+# (GitHub Team plan or above for private repositories).
+name: ndpx deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: staging or production
+        type: string
+        required: true
+      change-request:
+        description: Jira Service Management Change Request key (production only), e.g. CHG-123
+        type: string
+        default: ""
+      pipelines-ref:
+        type: string
+        default: v1
+    # Declared individually instead of `secrets: inherit`. Values come from the GitHub
+    # environment ("staging" / "production") set on the job below; callers pass nothing.
+    secrets:
+      NETLIFY_AUTH_TOKEN:
+        required: false
+      NETLIFY_SITE_ID:
+        required: false
+      SUPABASE_ACCESS_TOKEN:
+        required: false
+      SUPABASE_DB_PASSWORD:
+        required: false
+      JSM_API_TOKEN:
+        required: false
+
+permissions: {}
+
+env:
+  PIPELINES_REPO: agilebn/agile-pipelines
+  SUPABASE_CLI_VERSION: "2.122.0"
+  NETLIFY_CLI_VERSION: "27.14.2"
+  TRIVY_VERSION: "0.76.1"
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ inputs.environment }}
+      CHANGE_REQUEST: ${{ inputs.change-request }}
+      COMMIT_SHA: ${{ github.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+      JSM_BASE_URL: ${{ vars.JSM_BASE_URL }}
+      JSM_EMAIL: ${{ vars.JSM_EMAIL }}
+      JSM_API_TOKEN: ${{ secrets.JSM_API_TOKEN }}
+      JSM_APPROVED_STATUSES: ${{ vars.JSM_APPROVED_STATUSES }}
+      JSM_COMMIT_FIELD: ${{ vars.JSM_COMMIT_FIELD }}
+      JSM_WINDOW_START_FIELD: ${{ vars.JSM_WINDOW_START_FIELD }}
+      JSM_WINDOW_END_FIELD: ${{ vars.JSM_WINDOW_END_FIELD }}
+    steps:
+      - name: Validate request
+        run: |
+          case "$TARGET" in staging|production) ;; *) echo "::error::Unknown environment '$TARGET'"; exit 1;; esac
+          if [ "$TARGET" = "production" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "::error::Production deploys run from main only (got $GITHUB_REF)."; exit 1
+            fi
+          fi
+          for v in NETLIFY_AUTH_TOKEN NETLIFY_SITE_ID; do
+            if [ -z "${!v}" ]; then echo "::error::$v is not set for environment $TARGET."; exit 1; fi
+          done
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PIPELINES_REPO }}
+          ref: ${{ inputs.pipelines-ref }}
+          path: .ndpx-pipelines
+          persist-credentials: false
+
+      - name: "C19 Release SBOM"
+        run: |
+          set -euo pipefail
+          t="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tf="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tf" "$t/$tf"
+          curl -sSfL -o "$RUNNER_TEMP/trivy_checksums.txt" "$t/trivy_${TRIVY_VERSION}_checksums.txt"
+          (cd "$RUNNER_TEMP" && grep " $tf\$" trivy_checksums.txt | sha256sum --check -)
+          tar -xzf "$RUNNER_TEMP/$tf" -C "$RUNNER_TEMP" trivy
+          "$RUNNER_TEMP/trivy" fs --format cyclonedx --output "$RUNNER_TEMP/sbom-${TARGET}-${COMMIT_SHA}.cdx.json" --skip-dirs .ndpx-pipelines .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ inputs.environment }}-${{ github.sha }}
+          path: ${{ runner.temp }}/sbom-*.cdx.json
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Read config
+        id: cfg
+        run: |
+          pip install "pyyaml==6.0.3"
+          python .ndpx-pipelines/scripts/read_config.py .ndpx/pipeline.yml
+
+      - name: "C29 CAB approval verified in Jira Service Management"
+        if: inputs.environment == 'production' && inputs.change-request != ''
+        run: python3 .ndpx-pipelines/scripts/jsm_change.py verify --issue "$CHANGE_REQUEST" --commit "$COMMIT_SHA"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.cfg.outputs.node_version }}
+          cache: npm
+      - name: Build
+        env:
+          PREFIX: ${{ steps.cfg.outputs.env_prefix }}
+          PUBLIC_URL_VALUE: ${{ vars.SUPABASE_URL }}
+          PUBLIC_KEY_VALUE: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
+          APP_NAME_VALUE: ${{ vars.APP_NAME }}
+          BUILD_DIR: ${{ steps.cfg.outputs.build_dir }}
+          SRC_DIR: ${{ steps.cfg.outputs.src_dir }}
+        run: |
+          export "${PREFIX}SUPABASE_URL=${PUBLIC_URL_VALUE}" "${PREFIX}SUPABASE_PUBLISHABLE_KEY=${PUBLIC_KEY_VALUE}" "${PREFIX}APP_NAME=${APP_NAME_VALUE}"
+          if [ -z "${PUBLIC_URL_VALUE}" ] || [ -z "${PUBLIC_KEY_VALUE}" ]; then
+            echo "::error::SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY is empty for environment $TARGET. Add them as environment variables."
+            exit 1
+          fi
+          npm ci --ignore-scripts
+          npm run build
+          python3 .ndpx-pipelines/scripts/scan_bundle.py --dist "$BUILD_DIR" --src "$SRC_DIR"
+          if ! grep -rqF "${PUBLIC_URL_VALUE}" "$BUILD_DIR"; then
+            echo "::error::The built app does not contain the Supabase URL. Check env_prefix in .ndpx/pipeline.yml."
+            exit 1
+          fi
+
+      - name: Install Supabase CLI (npm, checksum-verified binary)
+        if: steps.cfg.outputs.has_supabase == 'true'
+        run: |
+          npm install --no-fund --no-audit --prefix "$RUNNER_TEMP/supabase-cli" "supabase@${SUPABASE_CLI_VERSION}"
+          echo "$RUNNER_TEMP/supabase-cli/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Database migrations (dry run, then apply)
+        if: steps.cfg.outputs.has_supabase == 'true'
+        run: |
+          set -euo pipefail
+          for v in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD SUPABASE_PROJECT_REF; do
+            if [ -z "${!v}" ]; then echo "::error::$v is not set for environment $TARGET."; exit 1; fi
+          done
+          supabase link --project-ref "$SUPABASE_PROJECT_REF" --password "$SUPABASE_DB_PASSWORD"
+          {
+            echo "### Database migrations for $TARGET"
+            echo '```'
+            supabase db push --dry-run --password "$SUPABASE_DB_PASSWORD"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          supabase db push --password "$SUPABASE_DB_PASSWORD"
+
+      - name: Record currently published frontend (for rollback)
+        id: before
+        run: echo "deploy_id=$(python3 .ndpx-pipelines/scripts/netlify_site.py current --site "$NETLIFY_SITE_ID")" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy frontend to Netlify
+        id: deploy
+        env:
+          BUILD_DIR: ${{ steps.cfg.outputs.build_dir }}
+        run: |
+          set -euo pipefail
+          msg="${COMMIT_SHA:0:7} ${CHANGE_REQUEST:-staging}"
+          npx --yes "netlify-cli@${NETLIFY_CLI_VERSION}" deploy --no-build --prod --dir "$BUILD_DIR" --site "$NETLIFY_SITE_ID" \
+            --auth "$NETLIFY_AUTH_TOKEN" --message "$msg" --json > deploy.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open("deploy.json"))
+          print(f"url={d.get('url') or d.get('deploy_url')}")
+          print(f"deploy_id={d.get('deploy_id', '')}")
+          PY
+
+      - name: "C32 Smoke test and security headers"
+        id: smoke
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: python3 .ndpx-pipelines/scripts/check_headers.py --url "$URL" --smoke
+
+      - name: Roll back frontend on failed smoke test
+        if: failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'
+        env:
+          PREVIOUS: ${{ steps.before.outputs.deploy_id }}
+        run: |
+          python3 .ndpx-pipelines/scripts/netlify_site.py restore --site "$NETLIFY_SITE_ID" --deploy "$PREVIOUS"
+          echo "::warning::Frontend rolled back. Database migrations are NOT rolled back automatically; follow the runbook."
+
+      - name: Record outcome on the Change Request
+        if: always() && inputs.environment == 'production' && inputs.change-request != ''
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          OUTCOME: ${{ job.status == 'success' && 'success' || (steps.smoke.outcome == 'failure' && 'rolled-back' || 'failed') }}
+        run: >-
+          python3 .ndpx-pipelines/scripts/jsm_change.py record --issue "$CHANGE_REQUEST" --commit "$COMMIT_SHA"
+          --result "$OUTCOME" --url "${URL:-}" --run "$RUN_URL" || true
+
+      - name: Release evidence
+        if: always()
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          DEPLOY_ID: ${{ steps.deploy.outputs.deploy_id }}
+        run: |
+          {
+            echo "### Release evidence"
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Environment | $TARGET |"
+            echo "| Commit | \`$COMMIT_SHA\` |"
+            echo "| Change Request | ${CHANGE_REQUEST:-n/a} |"
+            echo "| Netlify deploy | ${DEPLOY_ID:-n/a} |"
+            echo "| URL | ${URL:-n/a} |"
+            echo "| Triggered by | $GITHUB_ACTOR |"
+            echo "| Run | $RUN_URL |"
+          } >> "$GITHUB_STEP_SUMMARY"
